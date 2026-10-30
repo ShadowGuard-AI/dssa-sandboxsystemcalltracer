@@ -1,1 +1,0 @@
-`shlex` is part of Python's standard library and doesn't require separate installation, therefore no version constraint is needed.
