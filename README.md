@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dssa-SandboxSystemCallTracer
 A lightweight utility that traces system calls made by a sandboxed script using `ptrace` or `seccomp-tools`, logging the call number, arguments, and return value to identify suspicious behavior or resource access. - Focused on Performs basic dynamic analysis of scripts (e.g., Python, JavaScript, VBScript) in a sandboxed environment.  Focuses on identifying potentially malicious behaviors like file system modifications, network connections, and registry access by extracting events triggered during execution. Aims for minimal overhead and quick triage.
 
