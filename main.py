@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import shlex
+import shutil
 
 # Optional dependencies (install if needed: pip install python-magic oletools)
 try:
@@ -32,7 +33,7 @@ DEFAULT_TIMEOUT = 60  # seconds
 def setup_argparse():
     """Sets up the argument parser for the command line interface."""
 
-    parser = argparse.ArgumentParser(description="dssa-SandboxSystemCallTracer: A lightweight utility that traces system calls made by a sandboxed script.")
+    parser = argparse.ArgumentParser(description="dssa-SandboxSystemCallTracer: A lightweight utility that traces system calls made by a script (default run is unsandboxed; sandboxing is opt-in with --sandbox).")
     parser.add_argument("script", help="Path to the script to be analyzed.")
     parser.add_argument("--interpreter", "-i", help="Path to the interpreter to use (e.g., python3, javascript). If not specified, attempts to auto-detect.", default=None)
     parser.add_argument("--timeout", "-t", type=int, help=f"Timeout for script execution in seconds (default: {DEFAULT_TIMEOUT}).", default=DEFAULT_TIMEOUT)
@@ -84,54 +85,64 @@ def run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_
     if not os.path.exists(script_path):
         raise FileNotFoundError(f"Script not found: {script_path}")
 
-    if interpreter_path and not os.path.exists(interpreter_path):
-        raise FileNotFoundError(f"Interpreter not found: {interpreter_path}")
+    resolved_interpreter = None
+    if interpreter_path:
+        if os.path.exists(interpreter_path):
+            resolved_interpreter = interpreter_path
+        elif shutil.which(interpreter_path):
+            resolved_interpreter = shutil.which(interpreter_path)
+        else:
+            raise FileNotFoundError(f"Interpreter not found: {interpreter_path}")
 
-    # Construct the command
+    # Construct the command: interpreter and script exactly once in every branch.
     command = []
     if sandbox_enabled:
-        # Requires sudo and seccomp-tools installed (e.g., sudo apt install seccomp-tools)
-        # This is a basic example.  Customize the seccomp profile for more robust sandboxing.
         command.extend(["sudo", "seccomp-tools", "sandbox"])
-
-    if interpreter_path:
-        command.append(interpreter_path)
+    if resolved_interpreter:
+        command.append(resolved_interpreter)
+        command.append(script_path)
+    elif sandbox_enabled:
+        command.append(script_path)
     else:
-        # Attempt to auto-detect interpreter.  This is a basic approach and may need refinement.
+        # Auto-detect fallback: run the script itself exactly once.
         file_type = detect_file_type(script_path)
         if file_type and "python" in file_type:
-            command.append("python3")  # Or python, depending on the system
+            command = ["python3", script_path]
         elif file_type and "javascript" in file_type:
-            command.append("node") # Or rhino, depending on the system. Install node.js
+            command = ["node", script_path]
         elif file_type and "vbscript" in file_type:
-            command.append("cscript") #windows only.
+            command = ["cscript", script_path]
         else:
-            logging.warning("Could not auto-detect interpreter. Please specify with --interpreter.")
-            command.append(script_path)
-            command_line_args = [] #Prevent appending args to script directly, might cause errors.
-    
-    if not sandbox_enabled and interpreter_path is None and command[-1] == script_path:
-        command = [script_path] #just run the file.
-
-    command.append(script_path)
+            command = [script_path]
     command.extend(command_line_args)
-
 
     logging.debug(f"Executing command: {' '.join(map(shlex.quote, command))}") #Quote to handle spaces in arguments.
 
     try:
-        # Capture stdout and stderr separately.  Consider using `trace` tool for system call tracing
-        # but it often requires more configuration and might not be suitable for quick triage.
-        # For basic system call tracing, consider `strace` if available.  The following is a simplified example.
-        # THIS DOES NOT ACTUALLY TRACE SYSTEM CALLS.  It's a placeholder.  Requires `strace`.
-
-        # Using subprocess.run with a timeout and capturing both stdout and stderr
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout) #Changed to use text=True for easier handling
-
+        trace_text = ""
+        if sandbox_enabled:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        else:
+            strace_path = shutil.which("strace")
+            if not strace_path:
+                logging.error("strace not found: the system call tracer is missing. Install strace to trace system calls.")
+                print("strace not found: cannot trace system calls.")
+                sys.exit(1)
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                trace_file = tf.name
+            try:
+                traced_command = [strace_path, "-f", "-o", trace_file] + command
+                result = subprocess.run(traced_command, capture_output=True, text=True, timeout=timeout)
+                with open(trace_file) as tf2:
+                    trace_text = tf2.read()
+            finally:
+                try: os.unlink(trace_file)
+                except OSError: pass
         logging.info(f"Script execution completed with return code: {result.returncode}")
         logging.debug(f"stdout: {result.stdout}")
         logging.debug(f"stderr: {result.stderr}")
-
+        if trace_text:
+            logging.info(f"Traced {len([l for l in trace_text.splitlines() if l.strip()])} system call entries.")
         if output_file:
             try:
                 with open(output_file, "w") as f:
@@ -139,18 +150,15 @@ def run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_
                      f.write(f"Return code: {result.returncode}\n")
                      f.write(f"stdout:\n{result.stdout}\n")
                      f.write(f"stderr:\n{result.stderr}\n")
+                     f.write(f"System calls:\n{trace_text}\n")
                 logging.info(f"Output saved to: {output_file}")
-
             except Exception as e:
                 logging.error(f"Failed to save output to file: {e}")
-
-
-        # Basic error handling based on return code and stderr.  Expand as needed.
         if result.returncode != 0:
             logging.warning(f"Script execution returned a non-zero exit code: {result.returncode}")
-            if result.stderr:
-                logging.warning(f"stderr: {result.stderr}")
-        
+        return result.returncode
+    except SystemExit:
+        raise
     except subprocess.TimeoutExpired:
         logging.error(f"Script execution timed out after {timeout} seconds.")
         raise
@@ -160,7 +168,6 @@ def run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         raise
-
 
 
 def main():
@@ -174,6 +181,17 @@ def main():
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
     script_path = args.script
+    # Same-path guard: the output log must not be the script itself.
+    if args.output:
+        from pathlib import Path as _P
+        try:
+            if _P(args.script).resolve() == _P(args.output).resolve():
+                logging.error("Output path resolves to the script file. Refusing to overwrite the script.")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
     interpreter_path = args.interpreter
     timeout = args.timeout
     output_file = args.output
@@ -200,7 +218,9 @@ def main():
         if file_type and "vbscript" in file_type:
             analyze_vbscript(script_path)  # Uses oletools
 
-        run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_args, output_file, sandbox_enabled)
+        _rc = run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_args, output_file, sandbox_enabled)
+        if _rc:
+            sys.exit(_rc)
 
 
     except FileNotFoundError as e:
