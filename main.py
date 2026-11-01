@@ -44,6 +44,10 @@ def setup_argparse():
     return parser
 
 
+# One catch worth naming: current python-magic returns a str from
+# from_file, not bytes, so the .decode call raises AttributeError on those
+# installs and the except below turns it into a None result. Detection
+# quietly does nothing there instead of crashing the run.
 def detect_file_type(filepath):
     """Detects the file type using libmagic."""
     if magic:
@@ -95,6 +99,10 @@ def run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_
             raise FileNotFoundError(f"Interpreter not found: {interpreter_path}")
 
     # Construct the command: interpreter and script exactly once in every branch.
+    # The command is built in exactly one of these branches, and the script
+    # path is appended exactly once in each. The branches differ in who
+    # decides how the script runs: the caller's interpreter, the sandbox
+    # wrapper, or the MIME guess in the fallback.
     command = []
     if sandbox_enabled:
         command.extend(["sudo", "seccomp-tools", "sandbox"])
@@ -111,6 +119,9 @@ def run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_
         elif file_type and "javascript" in file_type:
             command = ["node", script_path]
         elif file_type and "vbscript" in file_type:
+            # cscript is a Windows host. On the Linux systems strace limits this tool
+            # to, this branch names a binary that will not be there, and the run
+            # fails as file not found rather than tracing anything.
             command = ["cscript", script_path]
         else:
             command = [script_path]
@@ -121,6 +132,10 @@ def run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_
     try:
         trace_text = ""
         if sandbox_enabled:
+        # Sandbox mode runs the command under seccomp-tools and captures no
+        # strace output, so trace_text stays empty and the saved log has an empty
+        # system call section. The sandbox is a containment choice, not a
+        # tracing one, and the two modes should not be expected to match.
             result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
         else:
             strace_path = shutil.which("strace")
@@ -131,6 +146,10 @@ def run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_
             with tempfile.NamedTemporaryFile(delete=False) as tf:
                 trace_file = tf.name
             try:
+                # -f follows child processes, which matters because the interesting calls
+                # often happen in something the script spawns. The trace goes to a temp
+                # file instead of stderr so it never mixes with the script's own output,
+                # and the finally below removes it even when the run times out.
                 traced_command = [strace_path, "-f", "-o", trace_file] + command
                 result = subprocess.run(traced_command, capture_output=True, text=True, timeout=timeout)
                 with open(trace_file) as tf2:
@@ -177,6 +196,9 @@ def main():
     args = parser.parse_args()
 
     # Configure logging
+    # basicConfig runs here, not at import, so the warnings printed during
+    # the optional imports above go through print on purpose. Anything logged
+    # before this line would use the root logger's default level.
     log_level = LOG_LEVELS.get(args.log_level.lower(), logging.INFO)
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -219,6 +241,9 @@ def main():
             analyze_vbscript(script_path)  # Uses oletools
 
         _rc = run_script_with_ptrace(script_path, interpreter_path, timeout, command_line_args, output_file, sandbox_enabled)
+        # The traced script's exit code becomes this tool's exit code. A script
+        # that fails under trace makes the tracer report failure too, so a caller
+        # cannot mistake a crashed run for a clean trace.
         if _rc:
             sys.exit(_rc)
 
